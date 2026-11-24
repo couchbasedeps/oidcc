@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: 2023 Erlang Ecosystem Foundation
+# SPDX-License-Identifier: Apache-2.0
+
+on:
+  workflow_call:
+    inputs:
+      oidcc_plug_version:
+        description: >-
+          `oidcc_plug` version to certify against. Either "main" for the
+          `main` branch of `erlef/oidcc_plug` or a Hex version requirement
+          such as "~> 0.5.0". Defaults to the requirement declared in
+          `certification/implementation_plug.exs`.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      OID_CERTIFICATION_API_TOKEN:
+        description: "OpenID Certification API Token"
+        required: true
+
+name: "Certification"
+
+permissions:
+  contents: read
+
+jobs:
+  certification:
+    name: "OpenID Certification"
+
+    runs-on: ubuntu-latest
+
+    environment: certification
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        id: setupBEAM
+        with:
+          version-file: .tool-versions
+          version-type: strict
+
+      - run: mkdir -p "$TMP/certification_out"
+        env:
+          TMP: ${{ runner.temp }}
+
+      # Prime Mix.install to prevent Mix Compile Locks
+      - run: 'echo "" | certification/implementation_plug.exs'
+        env:
+          OIDCC_PLUG_VERSION: ${{ inputs.oidcc_plug_version }}
+
+      - uses: erlef/oid_certo@e47ec90093332ecc3c11d0bdec85d5306c778c29 # v0.1.0-beta.4
+        with:
+          command: >-
+            certification/config.json
+            --implementation certification/implementation_plug.exs
+            --output-directory "$TMP/certification_out"
+          api-token: ${{ secrets.OID_CERTIFICATION_API_TOKEN }}
+        env:
+          TMP: ${{ runner.temp }}
+          OIDCC_PLUG_VERSION: ${{ inputs.oidcc_plug_version }}
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: certification-plug
+          path: "${{ runner.temp }}/certification_out"

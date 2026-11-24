@@ -5,6 +5,7 @@
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("jose/include/jose_jwk.hrl").
+-include_lib("oidcc/include/oidcc_provider_configuration.hrl").
 
 does_not_start_without_issuer_test() ->
     ?assertMatch(
@@ -251,6 +252,293 @@ accepts_generic_plus_json_content_type_test() ->
             end
         )
     end).
+
+replaces_changed_configuration_in_ets_test() ->
+    Name = ?FUNCTION_NAME,
+    Requests = atomics:new(1, []),
+    HttpFun =
+        fun
+            (
+                get,
+                {"https://example.com/.well-known/openid-configuration", []},
+                _HttpOpts,
+                _Opts,
+                _Profile
+            ) ->
+                Scopes =
+                    case atomics:add_get(Requests, 1, 1) of
+                        1 -> [<<"openid">>];
+                        _ -> [<<"openid">>, <<"email">>]
+                    end,
+                {ok, {
+                    {"HTTP/1.1", 200, "OK"},
+                    [{"content-type", "application/json"}],
+                    iolist_to_binary(
+                        json:encode(#{
+                            issuer => <<"https://example.com">>,
+                            jwks_uri => <<"https://example.com/keys">>,
+                            authorization_endpoint => <<"https://example.com/authorize">>,
+                            scopes_supported => Scopes,
+                            response_types_supported => [<<"code">>],
+                            subject_types_supported => [<<"public">>],
+                            id_token_signing_alg_values_supported => [<<"RS256">>]
+                        })
+                    )
+                }};
+            (
+                get,
+                {<<"https://example.com/keys">>, []},
+                _HttpOpts,
+                _Opts,
+                _Profile
+            ) ->
+                {ok, {
+                    {"HTTP/1.1", 200, "OK"},
+                    [{"content-type", "application/json"}],
+                    iolist_to_binary(json:encode(#{keys => []}))
+                }}
+        end,
+
+    with_httpc_mock(HttpFun, fun() ->
+        with_live_provider_worker(
+            #{
+                issuer => <<"https://example.com">>,
+                name => {local, Name}
+            },
+            fun(_Pid) ->
+                ok = oidcc_provider_configuration_worker:refresh_configuration(Name),
+                ?assertMatch(
+                    [
+                        {provider_configuration, #oidcc_provider_configuration{
+                            scopes_supported = [<<"openid">>, <<"email">>]
+                        }}
+                    ],
+                    ets:lookup(Name, provider_configuration)
+                )
+            end
+        )
+    end).
+
+retries_failed_jwks_load_test() ->
+    JwksRequests = atomics:new(1, []),
+    HttpFun = jwks_failing_http_fun(fun() -> atomics:add_get(JwksRequests, 1, 1) > 1 end),
+
+    with_httpc_mock(HttpFun, fun() ->
+        with_live_provider_worker(
+            #{
+                issuer => <<"https://example.com">>,
+                backoff_type => exponential,
+                backoff_min => 50,
+                backoff_max => 100
+            },
+            fun(Pid) ->
+                ?assertMatch(
+                    #jose_jwk{keys = {jose_jwk_set, []}},
+                    wait_until(fun() -> oidcc_provider_configuration_worker:get_jwks(Pid) end)
+                )
+            end
+        )
+    end).
+
+refreshes_jwks_for_unknown_kid_without_jwks_test() ->
+    HttpFun = jwks_failing_http_fun(fun() -> false end),
+
+    with_httpc_mock(HttpFun, fun() ->
+        with_live_provider_worker(
+            #{
+                issuer => <<"https://example.com">>,
+                backoff_type => random,
+                backoff_min => 500,
+                backoff_max => 500
+            },
+            fun(Pid) ->
+                ?assertNotEqual(
+                    undefined,
+                    wait_until(fun() ->
+                        oidcc_provider_configuration_worker:get_provider_configuration(Pid)
+                    end)
+                ),
+                ok = oidcc_provider_configuration_worker:refresh_jwks_for_unknown_kid(
+                    Pid, <<"kid">>
+                ),
+                ?assertEqual(undefined, oidcc_provider_configuration_worker:get_jwks(Pid))
+            end
+        )
+    end).
+
+refreshes_jwks_for_unknown_kid_only_test() ->
+    JwksRequests = atomics:new(1, []),
+    HttpFun = jwks_http_fun(JwksRequests, [<<"kid-1">>, <<"kid-2">>]),
+
+    with_httpc_mock(HttpFun, fun() ->
+        with_live_provider_worker(
+            #{issuer => <<"https://example.com">>},
+            fun(Pid) ->
+                ?assertMatch(
+                    #jose_jwk{keys = {jose_jwk_set, [_, _]}},
+                    wait_until(fun() ->
+                        oidcc_provider_configuration_worker:get_jwks(Pid)
+                    end)
+                ),
+                ?assertEqual(1, atomics:get(JwksRequests, 1)),
+
+                ok = oidcc_provider_configuration_worker:refresh_jwks_for_unknown_kid(
+                    Pid, <<"kid-1">>
+                ),
+                ok = oidcc_provider_configuration_worker:refresh_jwks_for_unknown_kid(
+                    Pid, <<"kid-2">>
+                ),
+                ?assertEqual(1, atomics:get(JwksRequests, 1)),
+
+                ok = oidcc_provider_configuration_worker:refresh_jwks_for_unknown_kid(
+                    Pid, <<"kid-3">>
+                ),
+                ?assertEqual(2, atomics:get(JwksRequests, 1))
+            end
+        )
+    end).
+
+refreshes_jwks_for_unknown_kid_with_key_without_kid_test() ->
+    JwksRequests = atomics:new(1, []),
+    HttpFun = jwks_http_fun(JwksRequests, [undefined, <<"kid-1">>]),
+
+    with_httpc_mock(HttpFun, fun() ->
+        with_live_provider_worker(
+            #{issuer => <<"https://example.com">>},
+            fun(Pid) ->
+                ?assertMatch(
+                    #jose_jwk{keys = {jose_jwk_set, [_, _]}},
+                    wait_until(fun() ->
+                        oidcc_provider_configuration_worker:get_jwks(Pid)
+                    end)
+                ),
+                ?assertEqual(1, atomics:get(JwksRequests, 1)),
+
+                ok = oidcc_provider_configuration_worker:refresh_jwks_for_unknown_kid(
+                    Pid, <<"kid-1">>
+                ),
+                ?assertEqual(1, atomics:get(JwksRequests, 1)),
+
+                ok = oidcc_provider_configuration_worker:refresh_jwks_for_unknown_kid(
+                    Pid, <<"kid-2">>
+                ),
+                ?assertEqual(2, atomics:get(JwksRequests, 1))
+            end
+        )
+    end).
+
+refreshes_jwks_once_for_concurrent_unknown_kids_test() ->
+    JwksRequests = atomics:new(1, []),
+    JwksFun = jwks_http_fun(JwksRequests, [<<"kid-1">>]),
+    HttpFun =
+        fun
+            (get, {<<"https://example.com/keys">>, []} = Request, HttpOpts, Opts, Profile) ->
+                timer:sleep(200),
+                JwksFun(get, Request, HttpOpts, Opts, Profile);
+            (Method, Request, HttpOpts, Opts, Profile) ->
+                JwksFun(Method, Request, HttpOpts, Opts, Profile)
+        end,
+
+    with_httpc_mock(HttpFun, fun() ->
+        with_live_provider_worker(
+            #{issuer => <<"https://example.com">>},
+            fun(Pid) ->
+                ?assertMatch(
+                    #jose_jwk{},
+                    wait_until(fun() ->
+                        oidcc_provider_configuration_worker:get_jwks(Pid)
+                    end)
+                ),
+                ?assertEqual(1, atomics:get(JwksRequests, 1)),
+
+                TestPid = self(),
+                Refs = [
+                    spawn_unknown_kid_refresh(TestPid, Pid, integer_to_binary(N))
+                 || N <- lists:seq(1, 20)
+                ],
+                [
+                    receive
+                        {refreshed, Ref} -> ok
+                    after 5_000 ->
+                        ct:fail(timeout_concurrent_refresh)
+                    end
+                 || Ref <- Refs
+                ],
+
+                ?assertEqual(2, atomics:get(JwksRequests, 1))
+            end
+        )
+    end).
+
+spawn_unknown_kid_refresh(TestPid, Pid, Kid) ->
+    Ref = make_ref(),
+    spawn_link(fun() ->
+        ok = oidcc_provider_configuration_worker:refresh_jwks_for_unknown_kid(Pid, Kid),
+        TestPid ! {refreshed, Ref}
+    end),
+    Ref.
+
+jwks_http_fun(JwksRequests, Kids) ->
+    Keys = [public_key_map(Kid) || Kid <- Kids],
+    JwksBody = iolist_to_binary(json:encode(#{keys => Keys})),
+    DiscoveryFun = jwks_failing_http_fun(fun() -> true end),
+    fun
+        (get, {<<"https://example.com/keys">>, []}, _HttpOpts, _Opts, _Profile) ->
+            atomics:add(JwksRequests, 1, 1),
+            {ok, {{"HTTP/1.1", 200, "OK"}, [{"content-type", "application/json"}], JwksBody}};
+        (Method, Request, HttpOpts, Opts, Profile) ->
+            DiscoveryFun(Method, Request, HttpOpts, Opts, Profile)
+    end.
+
+public_key_map(Kid) ->
+    {_Kty, KeyMap} = jose_jwk:to_public_map(jose_jwk:generate_key({ec, <<"P-256">>})),
+    case Kid of
+        undefined -> KeyMap;
+        _ -> KeyMap#{<<"kid">> => Kid}
+    end.
+
+jwks_failing_http_fun(JwksAvailable) ->
+    fun
+        (
+            get,
+            {"https://example.com/.well-known/openid-configuration", []},
+            _HttpOpts,
+            _Opts,
+            _Profile
+        ) ->
+            {ok, {
+                {"HTTP/1.1", 200, "OK"},
+                [{"content-type", "application/json"}],
+                iolist_to_binary(
+                    json:encode(#{
+                        issuer => <<"https://example.com">>,
+                        jwks_uri => <<"https://example.com/keys">>,
+                        authorization_endpoint => <<"https://example.com/authorize">>,
+                        scopes_supported => [<<"openid">>],
+                        response_types_supported => [<<"code">>],
+                        subject_types_supported => [<<"public">>],
+                        id_token_signing_alg_values_supported => [<<"RS256">>]
+                    })
+                )
+            }};
+        (
+            get,
+            {<<"https://example.com/keys">>, []},
+            _HttpOpts,
+            _Opts,
+            _Profile
+        ) ->
+            case JwksAvailable() of
+                true ->
+                    {ok, {
+                        {"HTTP/1.1", 200, "OK"},
+                        [{"content-type", "application/json"}],
+                        iolist_to_binary(json:encode(#{keys => []}))
+                    }};
+                false ->
+                    {ok, {{"HTTP/1.1", 503, "Service Unavailable"}, [], <<>>}}
+            end
+    end.
 
 with_httpc_mock(HttpFun, TestFun) ->
     ok = meck:new(httpc, [no_link]),

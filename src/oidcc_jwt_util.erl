@@ -58,6 +58,7 @@ and consumes the result.
     | invalid_jwt_token
     | {no_matching_key_with_kid, Kid :: binary()}
     | none_alg_used
+    | signature_required
     | {none_alg_used, Jwt :: #jose_jwt{}, Jws :: #jose_jws{}}
     | not_encrypted.
 
@@ -85,23 +86,7 @@ when
     Jws :: #jose_jws{},
     Jwk :: jose_jwk:key().
 verify_signature(Token, AllowAlgorithms, #jose_jwk{keys = {jose_jwk_set, Keys}}) ->
-    lists:foldl(
-        fun
-            (_Key, {ok, _Res} = Acc) ->
-                Acc;
-            (Key, Acc) ->
-                case {verify_signature(Token, AllowAlgorithms, Key), Acc} of
-                    {{ok, Res}, _Acc} ->
-                        {ok, Res};
-                    {_Res, {error, {no_matching_key_with_kid, Kid}}} ->
-                        {error, {no_matching_key_with_kid, Kid}};
-                    {Res, _Acc} ->
-                        Res
-                end
-        end,
-        {error, no_matching_key},
-        Keys
-    );
+    try_key_set(fun(Key) -> verify_signature(Token, AllowAlgorithms, Key) end, Keys);
 verify_signature(Token, AllowAlgorithms, #jose_jwk{} = Jwks) ->
     try
         Kid =
@@ -343,22 +328,8 @@ decrypt(_Jwt, _Jwk, undefined, _SupportedEncValues) ->
 decrypt(_Jwt, _Jwk, _SupportedAlgorithms, undefined) ->
     {error, no_supported_alg_or_key};
 decrypt(Jwt, #jose_jwk{keys = {jose_jwk_set, Keys}}, SupportedAlgorithms, SupportedEncValues) ->
-    lists:foldl(
-        fun
-            (_Key, {ok, _Res} = Acc) ->
-                Acc;
-            (Key, Acc) ->
-                case {decrypt(Jwt, Key, SupportedAlgorithms, SupportedEncValues), Acc} of
-                    {{ok, Res}, _Acc} ->
-                        {ok, Res};
-                    {_Res, {error, {no_matching_key_with_kid, Kid}}} ->
-                        {error, {no_matching_key_with_kid, Kid}};
-                    {Res, _Acc} ->
-                        Res
-                end
-        end,
-        {error, no_matching_key},
-        Keys
+    try_key_set(
+        fun(Key) -> decrypt(Jwt, Key, SupportedAlgorithms, SupportedEncValues) end, Keys
     );
 decrypt(Jwt, #jose_jwk{} = Jwk, SupportedAlgorithms, SupportedEncValues) ->
     maybe
@@ -383,10 +354,8 @@ decrypt(Jwt, #jose_jwk{} = Jwk, SupportedAlgorithms, SupportedEncValues) ->
                     {Token, _Jwe} = jose_jwe:block_decrypt(Jwk, Jwt),
                     {ok, Token}
                 catch
-                    error:_ when Kid =:= none ->
-                        {error, no_matching_key};
                     error:_ ->
-                        {error, {no_matching_key_with_kid, Kid}}
+                        {error, no_matching_key}
                 end
         end
     end.
@@ -399,13 +368,48 @@ verify_in_list(Value, List) ->
             {error, no_matching_key}
     end.
 
+-spec try_key_set(Fun, Keys) -> {ok, Result} | {error, error()} when
+    Fun :: fun((jose_jwk:key()) -> {ok, Result} | {error, error()}),
+    Keys :: [jose_jwk:key()],
+    Result :: term().
+try_key_set(Fun, Keys) ->
+    {_Rank, Result} =
+        lists:foldl(
+            fun
+                (_Key, {_AccRank, {ok, _Res}} = Acc) ->
+                    Acc;
+                (Key, {AccRank, _AccResult} = Acc) ->
+                    Result = Fun(Key),
+                    case key_result_rank(Key, Result) of
+                        Rank when Rank >= AccRank -> {Rank, Result};
+                        _Rank -> Acc
+                    end
+            end,
+            {0, {error, no_matching_key}},
+            Keys
+        ),
+    Result.
+
+%% The error of a key that the token kid selects must win over the kid error
+%% of other keys. The kid error must win over a key without kid, because only
+%% the kid error makes the caller refresh the key set.
+-spec key_result_rank(Key :: jose_jwk:key(), Result :: {ok, term()} | {error, error()}) ->
+    0..3.
+key_result_rank(_Key, {ok, _Res}) -> 3;
+key_result_rank(_Key, {error, {no_matching_key_with_kid, _Kid}}) -> 1;
+key_result_rank(#jose_jwk{fields = #{<<"kid">> := _}}, {error, _Reason}) -> 2;
+key_result_rank(#jose_jwk{}, {error, _Reason}) -> 0.
+
 verify_decrypted_token(Jwt, SigningAlgs, Jwe, Jwks) ->
     case verify_signature(Jwt, SigningAlgs, Jwks) of
         {ok, Result} ->
             %% encrypted + signed (nested) JWT
             {ok, Result};
         {error, invalid_jwt_token} ->
-            %% encrypted JWT, not signed: there is no signing key
+            %% Encrypted JWT, not signed. Whether that is acceptable depends on
+            %% the token: only the UserInfo response "MAY be encrypted without
+            %% also being signed". The callers that require a signature reject
+            %% the `#jose_jwe{}' returned here.
             try
                 {ok, {jose_jwt:from_binary(Jwt), Jwe, none}}
             catch
@@ -515,11 +519,17 @@ evaluate_for_all_keys(#jose_jwk{} = Jwk, Callback) ->
     Callback(Jwk).
 
 -doc false.
--spec verify_not_none_alg(#jose_jws{}) -> ok | {error, none_alg_used}.
+%% An encrypted token without a nested signature is refused for the same reason
+%% as the `none' algorithm: anyone holding the recipient's public encryption key
+%% can produce one, so it does not authenticate the issuer.
+-spec verify_not_none_alg(#jose_jws{} | #jose_jwe{}) ->
+    ok | {error, none_alg_used | signature_required}.
 verify_not_none_alg(#jose_jws{fields = #{<<"alg">> := <<"none">>}}) ->
     {error, none_alg_used};
 verify_not_none_alg(#jose_jws{}) ->
-    ok.
+    ok;
+verify_not_none_alg(#jose_jwe{}) ->
+    {error, signature_required}.
 
 %% Digest used by the given JWS signing algorithm.
 %%

@@ -151,6 +151,12 @@ handle_cast(refresh_configuration, State) ->
 handle_cast(refresh_jwks, State) ->
     {noreply, State, {continue, load_jwks}};
 handle_cast(
+    {refresh_jwks_for_unknown_kid, _Kid}, #state{provider_configuration = undefined} = State
+) ->
+    {noreply, State};
+handle_cast({refresh_jwks_for_unknown_kid, _Kid}, #state{jwks = undefined} = State) ->
+    {noreply, State, {continue, load_jwks}};
+handle_cast(
     {refresh_jwks_for_unknown_kid, _Kid},
     #state{jwks = #jose_jwk{keys = {jose_jwk_set, []}}} = State
 ) ->
@@ -214,9 +220,11 @@ handle_continue(
 
     maybe_cancel_timer(OldTimer),
 
+    LoadResult = oidcc_provider_configuration:load_jwks(JwksUri, ProviderConfigurationOpts),
+    ok = drop_queued_unknown_kid_refreshes(),
+
     maybe
-        {ok, {Jwks, Expiry}} ?=
-            oidcc_provider_configuration:load_jwks(JwksUri, ProviderConfigurationOpts),
+        {ok, {Jwks, Expiry}} ?= LoadResult,
         NewTimer = erlang:send_after(Expiry, self(), jwks_expired),
         ok = store_in_ets(EtsTable, jwks, Jwks),
         {noreply, State#state{
@@ -229,8 +237,8 @@ handle_continue(
     end.
 
 -doc false.
-handle_info(backoff_retry, State) ->
-    {noreply, State, {continue, load_configuration}};
+handle_info({backoff_retry, Continue}, State) ->
+    {noreply, State, {continue, Continue}};
 handle_info(configuration_expired, State) ->
     {noreply, State#state{jwks_refresh_timer = undefined}, {continue, load_configuration}};
 handle_info(jwks_expired, State) ->
@@ -356,14 +364,31 @@ has_kid(#jose_jwk{fields = #{<<"kid">> := _}}, _Kid) ->
 has_kid(#jose_jwk{keys = {jose_jwk_set, Keys}}, Kid) ->
     lists:foldl(
         fun
-            (_Key, Acc) when is_boolean(Acc) ->
-                Acc;
-            (Key, unknown) ->
-                has_kid(Key, Kid)
+            (_Key, true) ->
+                true;
+            (Key, Acc) ->
+                case has_kid(Key, Kid) of
+                    unknown -> Acc;
+                    Result -> Result
+                end
         end,
         unknown,
         Keys
-    ).
+    );
+has_kid(#jose_jwk{}, _Kid) ->
+    unknown.
+
+%% A queued request was sent before the fetch finished. Another fetch for it
+%% would only repeat the one that just ran. The pattern relies on the
+%% `gen_server:cast/2' message format.
+-spec drop_queued_unknown_kid_refreshes() -> ok.
+drop_queued_unknown_kid_refreshes() ->
+    receive
+        {'$gen_cast', {refresh_jwks_for_unknown_kid, _Kid}} ->
+            drop_queued_unknown_kid_refreshes()
+    after 0 ->
+        ok
+    end.
 
 -spec maybe_cancel_timer(Timer :: undefined | reference()) -> ok.
 maybe_cancel_timer(undefined) ->
@@ -403,10 +428,15 @@ get_ets_table_name(_Ref) ->
 register_ets_table(Opts) ->
     case maps:get(name, Opts, undefined) of
         {local, Name} ->
-            ets:new(Name, [named_table, bag, protected, {read_concurrency, true}]);
+            ets:new(Name, [named_table, set, protected, {read_concurrency, true}]);
         _OtherName ->
             undefined
     end.
+
+-spec retry_continue(ErrorType) -> load_configuration | load_jwks when
+    ErrorType :: jwks_load_failed | configuration_load_failed.
+retry_continue(configuration_load_failed) -> load_configuration;
+retry_continue(jwks_load_failed) -> load_jwks.
 
 -spec handle_backoff_retry(ErrorType, Reason, State) ->
     {stop, {ErrorType, Reason}, State} | {noreply, State}
@@ -435,7 +465,7 @@ handle_backoff_retry(
                 [Issuer, Wait, ErrorDetails],
                 #{error => ErrorDetails}
             ),
-            erlang:send_after(Wait, self(), backoff_retry),
+            erlang:send_after(Wait, self(), {backoff_retry, retry_continue(ErrorType)}),
             {noreply, State#state{
                 backoff_state = NewBackoffState
             }}

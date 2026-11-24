@@ -168,6 +168,26 @@ check_validations_test() ->
     ),
 
     ?assertMatch(
+        {error, {invalid_config_property, {uri_https, userinfo_endpoint}}},
+        oidcc_provider_configuration:decode_configuration(
+            google_merge_json(#{
+                <<"userinfo_endpoint">> =>
+                    <<"/userinfo">>
+            })
+        )
+    ),
+
+    ?assertMatch(
+        {error, {invalid_config_property, {uri_https, userinfo_endpoint}}},
+        oidcc_provider_configuration:decode_configuration(
+            google_merge_json(#{
+                <<"userinfo_endpoint">> =>
+                    <<"https://op.example/user info">>
+            })
+        )
+    ),
+
+    ?assertMatch(
         {error, {invalid_config_property, {uri, jwks_uri}}},
         oidcc_provider_configuration:decode_configuration(
             google_merge_json(#{
@@ -612,6 +632,353 @@ issuer_regex_quirk_test() ->
 
     ok.
 
+load_configuration_raw_test() ->
+    PrivDir = code:priv_dir(oidcc),
+    {ok, ConfigurationBinary} = file:read_file(PrivDir ++ "/test/fixtures/example-metadata.json"),
+    Document = json:decode(ConfigurationBinary),
+
+    HttpFun =
+        fun(get, _Request, _HttpOpts, _Opts, _Config) ->
+            {ok, {
+                {"HTTP/1.1", 200, "OK"},
+                [{"content-type", "application/json"}],
+                ConfigurationBinary
+            }}
+        end,
+    RequestOpts = #{
+        request_opts => #{http_adapter => {oidcc_http_adapter_test, #{request => HttpFun}}}
+    },
+
+    {ok, {Configuration, Expiry, ReturnedDocument}} =
+        oidcc_provider_configuration:load_configuration_raw(<<"https://my.provider">>, RequestOpts),
+
+    ?assertEqual(Document, ReturnedDocument),
+    ?assertMatch(#oidcc_provider_configuration{issuer = <<"https://my.provider">>}, Configuration),
+
+    %% The 2-arity function keeps returning the pair, built from the same load.
+    ?assertEqual(
+        {ok, {Configuration, Expiry}},
+        oidcc_provider_configuration:load_configuration(<<"https://my.provider">>, RequestOpts)
+    ),
+
+    ok.
+
+load_configuration_raw_returns_wire_document_test() ->
+    PrivDir = code:priv_dir(oidcc),
+    {ok, ConfigurationBinary} = file:read_file(PrivDir ++ "/test/fixtures/example-metadata.json"),
+
+    HttpFun =
+        fun(get, _Request, _HttpOpts, _Opts, _Config) ->
+            {ok, {
+                {"HTTP/1.1", 200, "OK"},
+                [{"content-type", "application/json"}],
+                ConfigurationBinary
+            }}
+        end,
+
+    {ok, {Configuration, _Expiry, Document}} =
+        oidcc_provider_configuration:load_configuration_raw(<<"https://my.provider">>, #{
+            request_opts => #{http_adapter => {oidcc_http_adapter_test, #{request => HttpFun}}},
+            quirks => #{
+                document_overrides => #{
+                    <<"token_endpoint">> => <<"https://my.provider/override/token">>
+                }
+            }
+        }),
+
+    %% `document_overrides' is merged while decoding, so the record carries the
+    %% override while the document stays what the provider served.
+    ?assertMatch(
+        #oidcc_provider_configuration{token_endpoint = <<"https://my.provider/override/token">>},
+        Configuration
+    ),
+    ?assertEqual(
+        maps:get(<<"token_endpoint">>, json:decode(ConfigurationBinary)),
+        maps:get(<<"token_endpoint">>, Document)
+    ),
+
+    ok.
+
+load_jwks_raw_test() ->
+    PrivDir = code:priv_dir(oidcc),
+    {ok, JwksBinary} = file:read_file(PrivDir ++ "/test/fixtures/google-jwks.json"),
+
+    HttpFun =
+        fun(get, _Request, _HttpOpts, _Opts, _Config) ->
+            {ok, {
+                {"HTTP/1.1", 200, "OK"},
+                [{"content-type", "application/jwk-set+json"}],
+                JwksBinary
+            }}
+        end,
+    RequestOpts = #{
+        request_opts => #{http_adapter => {oidcc_http_adapter_test, #{request => HttpFun}}}
+    },
+
+    {ok, {Jwks, Expiry, Document}} =
+        oidcc_provider_configuration:load_jwks_raw(<<"https://my.provider/jwks">>, RequestOpts),
+
+    ?assertEqual(json:decode(JwksBinary), Document),
+    ?assertMatch(#{<<"keys">> := _Keys}, Document),
+    ?assertEqual(jose_jwk:from(json:decode(JwksBinary)), Jwks),
+
+    ?assertEqual(
+        {ok, {Jwks, Expiry}},
+        oidcc_provider_configuration:load_jwks(<<"https://my.provider/jwks">>, RequestOpts)
+    ),
+
+    ok.
+
+%% The issuer_regex and allow_issuer_mismatch branches return the document from
+%% their own clauses, and they are the branches multi-tenant providers take, so
+%% they are exactly the population that wants the document persisted.
+load_configuration_raw_issuer_mismatch_branches_test() ->
+    PrivDir = code:priv_dir(oidcc),
+    {ok, ConfigurationBinary} = file:read_file(PrivDir ++ "/test/fixtures/example-metadata.json"),
+    Document = json:decode(ConfigurationBinary),
+
+    HttpFun =
+        fun(get, _Request, _HttpOpts, _Opts, _Config) ->
+            {ok, {
+                {"HTTP/1.1", 200, "OK"},
+                [{"content-type", "application/json"}],
+                ConfigurationBinary
+            }}
+        end,
+    RequestOpts = #{http_adapter => {oidcc_http_adapter_test, #{request => HttpFun}}},
+
+    %% Requested issuer differs from the document's, accepted via issuer_regex.
+    ?assertMatch(
+        {ok, {#oidcc_provider_configuration{}, _Expiry, Document}},
+        oidcc_provider_configuration:load_configuration_raw(<<"https://other.provider">>, #{
+            request_opts => RequestOpts,
+            quirks => #{issuer_regex => <<"^https://other\\.provider$">>}
+        })
+    ),
+
+    %% Same, accepted via the deprecated allow_issuer_mismatch quirk.
+    ?assertMatch(
+        {ok, {#oidcc_provider_configuration{}, _Expiry, Document}},
+        oidcc_provider_configuration:load_configuration_raw(<<"https://other.provider">>, #{
+            request_opts => RequestOpts,
+            quirks => #{allow_issuer_mismatch => true}
+        })
+    ),
+
+    ?assertMatch(
+        {error, {issuer_mismatch, <<"https://my.provider">>}},
+        oidcc_provider_configuration:load_configuration_raw(<<"https://other.provider">>, #{
+            request_opts => RequestOpts,
+            quirks => #{issuer_regex => <<"^https://nope$">>}
+        })
+    ),
+
+    ok.
+
+%% A syntactically valid JSON document that is not an object used to reach
+%% `maps:merge/2' and kill the caller.
+load_configuration_raw_non_object_test() ->
+    Body = fun(Json) ->
+        fun(get, _Request, _HttpOpts, _Opts, _Config) ->
+            {ok, {{"HTTP/1.1", 200, "OK"}, [{"content-type", "application/json"}], Json}}
+        end
+    end,
+    Opts = fun(Json) ->
+        #{request_opts => #{http_adapter => {oidcc_http_adapter_test, #{request => Body(Json)}}}}
+    end,
+
+    ?assertEqual(
+        {error, {invalid_document, null}},
+        oidcc_provider_configuration:load_configuration(<<"https://my.provider">>, Opts(<<"null">>))
+    ),
+    ?assertEqual(
+        {error, {invalid_document, []}},
+        oidcc_provider_configuration:load_configuration(<<"https://my.provider">>, Opts(<<"[]">>))
+    ),
+    ?assertEqual(
+        {error, {invalid_document, 1}},
+        oidcc_provider_configuration:load_configuration(<<"https://my.provider">>, Opts(<<"1">>))
+    ),
+
+    %% A JWKS may legitimately be a bare array of keys, so only scalars are
+    %% rejected there.
+    ?assertMatch(
+        {ok, {_Jwks, _Expiry, [#{<<"kty">> := <<"oct">>}]}},
+        oidcc_provider_configuration:load_jwks_raw(
+            <<"https://my.provider/jwks">>,
+            Opts(<<"[{\"kty\":\"oct\",\"k\":\"AAAA\"}]">>)
+        )
+    ),
+    ?assertEqual(
+        {error, {invalid_document, null}},
+        oidcc_provider_configuration:load_jwks_raw(
+            <<"https://my.provider/jwks">>, Opts(<<"null">>)
+        )
+    ),
+
+    ok.
+
+load_configuration_raw_error_test() ->
+    HttpFun =
+        fun(get, _Request, _HttpOpts, _Opts, _Config) ->
+            {ok, {{"HTTP/1.1", 404, "Not Found"}, [], <<>>}}
+        end,
+    RequestOpts = #{
+        request_opts => #{http_adapter => {oidcc_http_adapter_test, #{request => HttpFun}}}
+    },
+
+    ?assertMatch(
+        {error, {http_error, 404, <<>>}},
+        oidcc_provider_configuration:load_configuration_raw(<<"https://my.provider">>, RequestOpts)
+    ),
+    ?assertMatch(
+        {error, {http_error, 404, <<>>}},
+        oidcc_provider_configuration:load_jwks_raw(<<"https://my.provider/jwks">>, RequestOpts)
+    ),
+
+    ok.
+
+%% A response arriving with almost none of its `max-age` left reports a deadline
+%% near zero. Callers drive a refresh timer off it, so the loaders floor it
+%% rather than scheduling an immediate reload.
+minimum_refresh_floors_stale_response_test() ->
+    PrivDir = code:priv_dir(oidcc),
+    {ok, ConfigurationBinary} = file:read_file(PrivDir ++ "/test/fixtures/example-metadata.json"),
+
+    Load = fun(CacheHeaders, Opts) ->
+        HttpFun =
+            fun(get, _Request, _HttpOpts, _Opts, _Config) ->
+                {ok, {
+                    {"HTTP/1.1", 200, "OK"},
+                    [{"content-type", "application/json"} | CacheHeaders],
+                    ConfigurationBinary
+                }}
+            end,
+        oidcc_provider_configuration:load_configuration(
+            <<"https://my.provider">>,
+            maps:merge(Opts, #{
+                request_opts => #{
+                    http_adapter => {oidcc_http_adapter_test, #{request => HttpFun}}
+                }
+            })
+        )
+    end,
+
+    Stale = [{"cache-control", "max-age=3600"}, {"age", "3599"}],
+
+    ?assertMatch(
+        {ok, {#oidcc_provider_configuration{}, 60_000}},
+        Load(Stale, #{})
+    ),
+    %% The floor never raises the interval above what the caller asked for as a
+    %% fallback, so a caller wanting a shorter one still gets it.
+    ?assertMatch(
+        {ok, {#oidcc_provider_configuration{}, 5_000}},
+        Load(Stale, #{fallback_expiry => 5_000})
+    ),
+
+    %% A lifetime comfortably above the floor is passed through, less its Age.
+    ?assertMatch(
+        {ok, {#oidcc_provider_configuration{}, 240_000}},
+        Load([{"cache-control", "max-age=300"}, {"age", "60"}], #{})
+    ),
+
+    %% `max-age=0, no-store` still lands on the fallback, as issue #370 needs.
+    ?assertMatch(
+        {ok, {#oidcc_provider_configuration{}, 12_345}},
+        Load([{"cache-control", "max-age=0, no-store"}], #{fallback_expiry => 12_345})
+    ),
+
+    ok.
+
+%% The measurement that matters: a nearly-stale provider must not turn the
+%% worker into a request loop.
+stale_response_does_not_loop_test() ->
+    Counter = atomics:new(1, []),
+    DiscoveryBody = iolist_to_binary(
+        json:encode(#{
+            issuer => <<"https://example.com">>,
+            jwks_uri => <<"https://example.com/keys">>,
+            authorization_endpoint => <<"https://example.com/authorize">>,
+            scopes_supported => [<<"openid">>],
+            response_types_supported => [<<"code">>],
+            subject_types_supported => [<<"public">>],
+            id_token_signing_alg_values_supported => [<<"RS256">>]
+        })
+    ),
+    Headers = [
+        {"content-type", "application/json"},
+        {"cache-control", "max-age=3600"},
+        {"age", "3599"}
+    ],
+    HttpFun =
+        fun(get, {Url, []}, _HttpOpts, _Opts, _Profile) ->
+            atomics:add(Counter, 1, 1),
+            Body =
+                case iolist_to_binary(Url) of
+                    <<"https://example.com/keys">> ->
+                        iolist_to_binary(json:encode(#{keys => []}));
+                    _Discovery ->
+                        DiscoveryBody
+                end,
+            {ok, {{"HTTP/1.1", 200, "OK"}, Headers, Body}}
+        end,
+
+    {ok, Pid} =
+        oidcc_provider_configuration_worker:start_link(#{
+            issuer => <<"https://example.com">>,
+            provider_configuration_opts => #{
+                request_opts => #{
+                    http_adapter => {oidcc_http_adapter_test, #{request => HttpFun}}
+                }
+            }
+        }),
+
+    try
+        ?assertNotEqual(
+            undefined,
+            oidcc_provider_configuration_worker:get_provider_configuration(Pid)
+        ),
+        timer:sleep(1_000),
+        %% One discovery plus one JWKS load. Without the floor this was a
+        %% sustained one request per second per endpoint.
+        ?assert(atomics:get(Counter, 1) =< 4)
+    after
+        gen_server:stop(Pid)
+    end,
+
+    ok.
+
+invalid_json_configuration_test() ->
+    HttpFun =
+        fun(get, _Request, _HttpOpts, _Opts, _Config) ->
+            {ok, {
+                {"HTTP/1.1", 200, "OK"},
+                [{"content-type", "application/json"}],
+                <<"{\"issuer\": ">>
+            }}
+        end,
+
+    ?assertMatch(
+        {error, {invalid_json, _}},
+        oidcc_provider_configuration:load_configuration(<<"https://example.com">>, #{
+            request_opts => #{
+                http_adapter => {oidcc_http_adapter_test, #{request => HttpFun}}
+            }
+        })
+    ),
+
+    ?assertMatch(
+        {error, {invalid_json, _}},
+        oidcc_provider_configuration:load_jwks(<<"https://example.com/keys">>, #{
+            request_opts => #{
+                http_adapter => {oidcc_http_adapter_test, #{request => HttpFun}}
+            }
+        })
+    ),
+
+    ok.
+
 uri_concatenation_test() ->
     ok = meck:new(httpc, [no_link]),
     HttpFun =
@@ -655,6 +1022,124 @@ uri_concatenation_test() ->
     end,
 
     meck:unload(httpc),
+
+    ok.
+
+%% OpenID Connect Discovery 1.0 section 2 gives the Issuer Identifier as a URL
+%% with no query or fragment. Such an issuer used to build a discovery URL
+%% pointing at a different path on the same host.
+issuer_query_and_fragment_rejected_test() ->
+    Self = self(),
+    HttpFun =
+        fun(get, {ReqEndpoint, _Header}, _HttpOpts, _Opts, _Config) ->
+            Self ! {req, iolist_to_binary(ReqEndpoint)},
+            {ok, {{"HTTP/1.1", 501, "Not Implemented"}, [], <<>>}}
+        end,
+    Opts = #{
+        request_opts => #{http_adapter => {oidcc_http_adapter_test, #{request => HttpFun}}}
+    },
+
+    lists:foreach(
+        fun(Issuer) ->
+            ?assertEqual(
+                {error, {invalid_issuer, Issuer}},
+                oidcc_provider_configuration:load_configuration(Issuer, Opts)
+            )
+        end,
+        [
+            <<"https://example.com/realm?tenant=other">>,
+            <<"https://example.com/realm#frag">>,
+            <<"https://example.com/realm?tenant=other#frag">>,
+            <<"https://example.com?tenant=other">>,
+            <<"https://example.com/?tenant=other">>,
+            <<"https://example.com/realm/?tenant=other">>
+        ]
+    ),
+
+    %% Rejected before the request is built, so nothing was fetched.
+    receive
+        {req, Endpoint} -> ?assert({unexpected_request, Endpoint} =:= no_request)
+    after 0 -> ok
+    end,
+
+    %% An issuer without either component resolves exactly as before.
+    lists:foreach(
+        fun({Issuer, Expected}) ->
+            oidcc_provider_configuration:load_configuration(Issuer, Opts),
+            receive
+                {req, Got} -> ?assertEqual(Expected, Got)
+            after 0 -> ?assert({no_request_for, Issuer} =:= request_made)
+            end
+        end,
+        [
+            {<<"https://example.com">>, <<"https://example.com/.well-known/openid-configuration">>},
+            {<<"https://example.com/">>,
+                <<"https://example.com/.well-known/openid-configuration">>},
+            {<<"https://example.com/realm">>,
+                <<"https://example.com/realm/.well-known/openid-configuration">>},
+            {<<"https://example.com/realm/">>,
+                <<"https://example.com/realm/.well-known/openid-configuration">>}
+        ]
+    ),
+
+    ok.
+
+%% An issuer that fails to parse is not evidence of a query or a fragment.
+%% Microsoft Entra ID documents its issuer with a `{tenantid}` placeholder,
+%% which `uri_string:parse/1` rejects on the braces.
+unparseable_issuer_accepted_test() ->
+    Entra = <<"https://login.microsoftonline.com/{tenantid}/v2.0">>,
+
+    ?assertMatch(
+        {error, {invalid_issuer, Entra}},
+        oidcc_provider_configuration:decode_configuration(
+            google_merge_json(#{<<"issuer">> => Entra})
+        )
+    ),
+
+    ?assertMatch(
+        {ok, #oidcc_provider_configuration{issuer = Entra}},
+        oidcc_provider_configuration:decode_configuration(
+            google_merge_json(#{<<"issuer">> => Entra}),
+            #{quirks => #{issuer_regex => <<"^https://login.microsoftonline.com/[^/]+/v2\\.0$">>}}
+        )
+    ),
+
+    ok.
+
+%% The issuer a provider states in its own document gets the same check, unless
+%% `issuer_regex` says the issuer is not literal.
+document_issuer_query_and_fragment_rejected_test() ->
+    WithQuery = <<"https://my.provider/realm?tenant=other">>,
+    WithFragment = <<"https://my.provider/realm#frag">>,
+
+    ?assertEqual(
+        {error, {invalid_issuer, WithQuery}},
+        oidcc_provider_configuration:decode_configuration(
+            google_merge_json(#{<<"issuer">> => WithQuery})
+        )
+    ),
+    ?assertEqual(
+        {error, {invalid_issuer, WithFragment}},
+        oidcc_provider_configuration:decode_configuration(
+            google_merge_json(#{<<"issuer">> => WithFragment})
+        )
+    ),
+
+    %% `issuer_regex` opts the provider out.
+    ?assertMatch(
+        {ok, #oidcc_provider_configuration{issuer = WithQuery}},
+        oidcc_provider_configuration:decode_configuration(
+            google_merge_json(#{<<"issuer">> => WithQuery}),
+            #{quirks => #{issuer_regex => <<"^https://my.provider">>}}
+        )
+    ),
+
+    %% An ordinary issuer is untouched.
+    ?assertMatch(
+        {ok, #oidcc_provider_configuration{issuer = <<"https://accounts.google.com">>}},
+        oidcc_provider_configuration:decode_configuration(google_merge_json(#{}))
+    ),
 
     ok.
 
