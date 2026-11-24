@@ -412,9 +412,12 @@ attempt_par(
     RequestOpts = maps:get(request_opts, Opts, #{}),
 
     maybe
+        %% The auth method adds client_id to the body when it needs it.
+        %% client_secret_basic does not, and some providers (Okta) reject
+        %% a body client_id next to an Authorization header.
         {ok, {Body0, Header}, AuthMethod} ?=
             oidcc_auth_util:add_client_authentication(
-                QueryParams,
+                lists:keydelete(<<"client_id">>, 1, QueryParams),
                 Header0,
                 SupportedAuthMethods,
                 SigningAlgs,

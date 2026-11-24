@@ -819,6 +819,71 @@ create_redirect_url_with_par_url_test() ->
 
     ok.
 
+create_redirect_url_with_par_basic_auth_test() ->
+    PrivDir = code:priv_dir(oidcc),
+
+    {ok, _} = application:ensure_all_started(oidcc),
+
+    {ok, ValidConfigString} = file:read_file(PrivDir ++ "/test/fixtures/example-metadata.json"),
+    {ok, Configuration0} = oidcc_provider_configuration:decode_configuration(
+        json:decode(ValidConfigString)
+    ),
+
+    Configuration = Configuration0#oidcc_provider_configuration{
+        pushed_authorization_request_endpoint = <<"https://my.server/par">>
+    },
+
+    ParResponseData =
+        iolist_to_binary(
+            json:encode(#{
+                <<"request_uri">> => <<"urn:ietf:params:oauth:request_uri:par_response">>,
+                <<"expires_in">> => 60
+            })
+        ),
+
+    ClientId = <<"client_id">>,
+    ClientSecret = <<"at_least_32_character_client_secret">>,
+
+    Jwks = jose_jwk:from_pem_file(PrivDir ++ "/test/fixtures/jwk.pem"),
+
+    ClientContext =
+        oidcc_client_context:from_manual(Configuration, Jwks, ClientId, ClientSecret),
+
+    HttpFun =
+        fun(
+            post,
+            {_ReqParEndpoint, Header, "application/x-www-form-urlencoded", Body},
+            _HttpOpts,
+            _Opts,
+            _Profile
+        ) ->
+            ?assertMatch({"authorization", _}, proplists:lookup("authorization", Header)),
+            BodyMap = maps:from_list(uri_string:dissect_query(Body)),
+            %% Credentials go in the header only.
+            ?assertNot(maps:is_key(<<"client_id">>, BodyMap)),
+            ?assertNot(maps:is_key(<<"client_secret">>, BodyMap)),
+            ?assertMatch(#{<<"response_type">> := <<"code">>}, BodyMap),
+
+            {ok, {{"HTTP/1.1", 201, "OK"}, [{"content-type", "application/json"}], ParResponseData}}
+        end,
+    Adapter = {oidcc_http_adapter_test, #{request => HttpFun}},
+
+    {ok, Url} = oidcc_authorization:create_redirect_url(ClientContext, #{
+        redirect_uri => <<"https://my.server/return">>,
+        preferred_auth_methods => [client_secret_basic],
+        request_opts => #{http_adapter => Adapter}
+    }),
+
+    ?assertEqual(
+        #{
+            <<"request_uri">> => <<"urn:ietf:params:oauth:request_uri:par_response">>,
+            <<"client_id">> => ClientId
+        },
+        parse_query_string(iolist_to_binary(Url))
+    ),
+
+    ok.
+
 create_redirect_url_with_par_error_when_required_test() ->
     PrivDir = code:priv_dir(oidcc),
 
